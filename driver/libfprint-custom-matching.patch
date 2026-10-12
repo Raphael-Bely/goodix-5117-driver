@@ -1,0 +1,282 @@
+diff --git a/libfprint/fp-image-device.c b/libfprint/fp-image-device.c
+index ac88ffd9..ab6c7317 100644
+--- a/libfprint/fp-image-device.c
++++ b/libfprint/fp-image-device.c
+@@ -123,10 +123,17 @@ fp_image_device_start_capture_action (FpDevice *device)
+     {
+       FpPrint *enroll_print = NULL;
+ 
++      /* A driver that serialises images itself stores raw blobs rather than
++       * minutiae; typing the print NBIS here would send it down the wrong
++       * serialisation path and lose the data. */
++      FpiPrintType wanted = FP_IMAGE_DEVICE_GET_CLASS (self)->serialize_image
++                            ? FPI_PRINT_RAW
++                            : FPI_PRINT_NBIS;
++
+       fpi_device_get_enroll_data (device, &enroll_print);
+       g_object_get (enroll_print, "fpi-type", &print_type, NULL);
+-      if (print_type != FPI_PRINT_NBIS)
+-        fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
++      if (print_type != wanted)
++        fpi_print_set_type (enroll_print, wanted);
+     }
+ 
+   priv->enroll_stage = 0;
+diff --git a/libfprint/fpi-image-device.c b/libfprint/fpi-image-device.c
+index 87bdc600..2363652a 100644
+--- a/libfprint/fpi-image-device.c
++++ b/libfprint/fpi-image-device.c
+@@ -238,6 +238,149 @@ fp_image_device_maybe_complete_action (FpImageDevice *self, GError *error)
+     }
+ }
+ 
++/* Appends one blob to the array a print accumulates during enrolment. */
++static void
++image_device_accumulate (FpPrint *enroll_print, GVariant *blob)
++{
++  g_autoptr(GVariant) existing = NULL;
++  GVariantBuilder builder;
++
++  g_object_get (enroll_print, "fpi-data", &existing, NULL);
++  g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
++
++  if (existing && g_variant_is_of_type (existing, G_VARIANT_TYPE ("aay")))
++    {
++      GVariantIter iter;
++      GVariant *child;
++
++      g_variant_iter_init (&iter, existing);
++      while ((child = g_variant_iter_next_value (&iter)))
++        {
++          g_variant_builder_add_value (&builder, child);
++          g_variant_unref (child);
++        }
++    }
++
++  g_variant_builder_add_value (&builder, blob);
++  g_object_set (enroll_print, "fpi-data",
++                g_variant_builder_end (&builder), NULL);
++}
++
++/* Same job as fpi_image_device_minutiae_detected, for drivers that supply
++ * their own comparison instead of relying on NBIS. */
++static void
++image_device_custom_captured (FpImageDevice *self, FpImage *image)
++{
++  FpDevice *device = FP_DEVICE (self);
++  FpImageDeviceClass *klass = FP_IMAGE_DEVICE_GET_CLASS (self);
++  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
++  FpiDeviceAction action = fpi_device_get_current_action (device);
++
++  g_autoptr(FpPrint) print = NULL;
++  g_autoptr(GVariant) data = NULL;
++  GError *error = NULL;
++
++  if (action == FPI_DEVICE_ACTION_CAPTURE)
++    {
++      priv->capture_image = g_object_ref (image);
++      fp_image_device_maybe_complete_action (self, NULL);
++      return;
++    }
++
++  data = klass->serialize_image (self, image);
++  if (data)
++    g_variant_ref_sink (data);
++
++  if (data == NULL)
++    {
++      error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
++                                        "Could not use this scan, please retry");
++    }
++  else
++    {
++      print = fp_print_new (device);
++      fpi_print_set_type (print, FPI_PRINT_RAW);
++      g_object_set (print, "fpi-data", data, NULL);
++    }
++
++  if (action == FPI_DEVICE_ACTION_ENROLL)
++    {
++      FpPrint *enroll_print;
++
++      fpi_device_get_enroll_data (device, &enroll_print);
++
++      /* A touch that matches none of the ones already kept covers a different
++       * patch of skin. Keeping it scatters the enrolment, which drags later
++       * scores down and, worse, makes the stored print describe skin in
++       * general rather than this finger. Ask for it again instead. */
++      if (print && priv->enroll_stage > 0)
++        {
++          g_autoptr(GVariant) accumulated = NULL;
++
++          g_object_get (enroll_print, "fpi-data", &accumulated, NULL);
++
++          if (accumulated && !klass->compare_data (self, data, accumulated, TRUE))
++            {
++              g_clear_object (&print);
++              error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
++                                                "Put the same part of the "
++                                                "finger down as before");
++            }
++        }
++
++      if (print)
++        {
++          /* The type was settled when the enroll action started. */
++          image_device_accumulate (enroll_print, data);
++          priv->enroll_stage += 1;
++        }
++
++      fpi_device_enroll_progress (device, priv->enroll_stage,
++                                  g_steal_pointer (&print), error);
++
++      if (priv->enroll_stage == fp_device_get_nr_enroll_stages (device))
++        {
++          fp_image_device_maybe_complete_action (self, NULL);
++          fpi_image_device_deactivate (self, FALSE);
++        }
++      else
++        {
++          fp_image_device_enroll_maybe_await_finger_on (self);
++        }
++    }
++  else if (action == FPI_DEVICE_ACTION_IDENTIFY)
++    {
++      GPtrArray *templates;
++      FpPrint *result = NULL;
++
++      fpi_device_get_identify_data (device, &templates);
++
++      for (guint i = 0; print && i < templates->len; i++)
++        {
++          FpPrint *candidate = g_ptr_array_index (templates, i);
++          g_autoptr(GVariant) enrolled = NULL;
++
++          g_object_get (candidate, "fpi-data", &enrolled, NULL);
++          if (enrolled == NULL)
++            continue;
++
++          if (klass->compare_data (self, data, enrolled, FALSE))
++            {
++              result = candidate;
++              break;
++            }
++        }
++
++      fpi_device_identify_report (device, result, g_steal_pointer (&print),
++                                  error);
++      fp_image_device_maybe_complete_action (self, NULL);
++    }
++  else
++    {
++      g_clear_error (&error);
++    }
++}
++
+ static void
+ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data)
+ {
+@@ -481,6 +624,20 @@ fpi_image_device_image_captured (FpImageDevice *self, FpImage *image)
+ 
+   g_debug ("Image device captured an image");
+ 
++  if (FP_IMAGE_DEVICE_GET_CLASS (self)->serialize_image)
++    {
++      /* Minutiae would find nothing usable on a frame this small.
++       *
++       * The state has to leave CAPTURE first: the NBIS path gets that for
++       * free because its detection is asynchronous, and completing an action
++       * while still in CAPTURE derails the state machine. */
++      fp_image_device_change_state (self,
++                                    FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF);
++      image_device_custom_captured (self, image);
++      g_object_unref (image);
++      return;
++    }
++
+   priv->minutiae_scan_active = TRUE;
+ 
+   /* XXX: We also detect minutiae in capture mode, we solely do this
+diff --git a/libfprint/fpi-image-device.h b/libfprint/fpi-image-device.h
+index 71472dbb..bd18d469 100644
+--- a/libfprint/fpi-image-device.h
++++ b/libfprint/fpi-image-device.h
+@@ -114,6 +114,25 @@ struct _FpImageDeviceClass
+   void          (*change_state) (FpImageDevice      *dev,
+                                  FpiImageDeviceState state);
+   void          (*deactivate)   (FpImageDevice *dev);
++
++  /* Frames from some sensors are far too small for minutiae extraction to
++   * find anything usable. A driver that provides both of these takes over:
++   * minutiae detection is skipped, prints carry whatever @serialize_image
++   * returns, and @compare_data decides matches.
++   *
++   * @serialize_image turns one capture into driver-specific data, or NULL to
++   * ask the user to try again.
++   *
++   * @compare_data is handed the probe's data and the array of blobs collected
++   * so far. @enrolling tells it which question is being asked: during
++   * enrolment it guards coherence between captures, and a driver will usually
++   * want a stricter bar there than when deciding a match. */
++  GVariant   * (*serialize_image) (FpImageDevice *dev,
++                                   FpImage       *image);
++  gboolean     (*compare_data)    (FpImageDevice *dev,
++                                   GVariant      *probe,
++                                   GVariant      *enrolled,
++                                   gboolean       enrolling);
+ };
+ 
+ void fpi_image_device_set_bz3_threshold (FpImageDevice *self,
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index f11533ca..469b6c2c 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -123,6 +123,18 @@ driver_sources = {
+     'elanmoc' : files('drivers/elanmoc/elanmoc.c'),
+     'elanspi' : files('drivers/elanspi.c'),
+     'nb1010' : files('drivers/nb1010.c'),
++    'goodix5117' : files(
++        'drivers/goodix5117/goodix5117.c',
++        'drivers/goodix5117/device.c',
++        'drivers/goodix5117/protocol.c',
++        'drivers/goodix5117/config.c',
++        'drivers/goodix5117/init.c',
++        'drivers/goodix5117/session.c',
++        'drivers/goodix5117/tls.c',
++        'drivers/goodix5117/capture.c',
++        'drivers/goodix5117/image.c',
++        'drivers/goodix5117/match.c',
++    ),
+     'virtual_image' : files('drivers/virtual-image.c'),
+     'virtual_device' : files('drivers/virtual-device.c'),
+     'virtual_device_storage' : files('drivers/virtual-device-storage.c'),
+@@ -216,6 +228,8 @@ deps = [
+     gobject_dep,
+     gusb_dep,
+     mathlib_dep,
++    dependency('openssl'),
++    dependency('libusb-1.0'),
+ ] + optional_deps
+ 
+ # These are empty and only exist so that the include directories are created
+@@ -226,6 +240,8 @@ deps += declare_dependency(include_directories: [
+     root_inc,
+     include_directories('nbis/include'),
+     include_directories('nbis/libfprint-include'),
++    # Lets the vendored goodix sources keep their own "goodix/..." includes.
++    include_directories('drivers/goodix5117'),
+ ])
+ 
+ libnbis = static_library('nbis',
+diff --git a/meson.build b/meson.build
+index ab09dc1d..9f882a35 100644
+--- a/meson.build
++++ b/meson.build
+@@ -115,6 +115,7 @@ have_spi = host_machine.system() == 'linux'
+ drivers = get_option('drivers').split(',')
+ 
+ drivers_info = {
++    'goodix5117': {},
+     'upektc_img': {},
+     'vfs5011': { 'endian_dependent': true },
+     'vfs7552': {},

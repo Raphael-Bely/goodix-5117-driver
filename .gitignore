@@ -1,0 +1,18 @@
+build/
+reference/
+
+# Device pairing key — never commit. See SPEC.md section 6.
+clef.txt
+*.psk
+*.key
+psk*.hex
+firmware-dump.bin
+# raw captures are biometric data
+frame-*.bin
+*.pgm
+samples/
+*.enrol
+# fprintd's example storage holds the same biometric templates
+test-storage.variant
+*.log
+libfprint/
